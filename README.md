@@ -44,4 +44,6 @@ Here are some ideas to get you started:
 ![Google Gemini](https://img.shields.io/badge/Gemini-8E75B2?style=for-the-badge&logo=googlegemini&logoColor=white)
 
 ---
+내 깃허브 프로필 주소 : https://github.com/vimabjg-hash
+구글 독스 기획 주소 : https://docs.google.com/document/d/15YmG_guNACVK_PgagR81NKmXcry31dHVe431qrBd_Os/edit?tab=t.c2qyluo1ior
 *이 프로필은 Gemini 3 pro와 함께 작성되었습니다.*
