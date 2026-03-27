@@ -1,0 +1,54 @@
+{
+  "manifest_version": 3,
+  "name": "Aurora",
+  "version": "0.2.0",
+  "description": "AI assistant side panel",
+  "permissions": [
+    "sidePanel",
+    "storage",
+    "activeTab",
+    "scripting",
+    "tabs"
+  ],
+  "host_permissions": [],
+  "background": {
+    "service_worker": "service-worker-loader.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "js": [
+        "assets/index.ts-D8DYkQnr.js"
+      ],
+      "matches": [
+        "<all_urls>"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "resources": [
+        "assets/index.ts-D8DYkQnr.js"
+      ],
+      "use_dynamic_url": false
+    }
+  ],
+  "side_panel": {
+    "default_path": "src/sidepanel/sidepanel.html"
+  },
+  "commands": {
+    "open-sidepanel": {
+      "suggested_key": {
+        "default": "Alt+A"
+      },
+      "description": "Aurora 사이드패널 열기"
+    }
+  },
+  "action": {
+    "default_title": "Aurora"
+  }
+}
