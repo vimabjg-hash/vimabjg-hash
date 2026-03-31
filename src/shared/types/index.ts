@@ -1,9 +1,8 @@
 export type ToolbarMode   = 'read' | 'write'
 export type ToolbarAction =
-  | 'translate' | 'summarize' | 'refine' | 'ask' | 'save'
+  | 'translate' | 'summarize' | 'grammar' | 'draft' | 'ask' | 'save'
   | 'shorter'   | 'longer'    | 'tone'
-
-export type PersonaId = 'minimalist' | 'devil' | 'dictionary' | 'master'
+  | 'copy'      | 'highlight' | 'refine'
 
 // 원문 위치 메타데이터 — observer에서 캡처, toolbar/shell로 전달
 export interface SourceMeta {

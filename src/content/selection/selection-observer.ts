@@ -28,6 +28,7 @@ export class SelectionObserver {
   private readonly callback: SelectionCallback
   private suppressUntil = 0    // X 클릭 후 툴바 재생성 차단 타임스탬프
   private lastSnapshot: SelectionInfo | null = null  // P0-5: 우클릭 시 스냅샷 유지
+  private mouseDownPos = { x: 0, y: 0 }  // 유령 선택 방어용 클릭 좌표
 
   constructor(callback: SelectionCallback) {
     this.callback = callback
@@ -61,7 +62,9 @@ export class SelectionObserver {
         return
       }
 
-      // rect: 가능하면 DOM Range, 없으면 input 자체의 bounding rect 사용
+      // rect: 가능하면 DOM Range, 없으면 input 자체의 bounding rect 사용.
+      // React/Vue 등의 검색창은 실제 input을 x:0,y:0 또는 width:0으로 숨기는 경우가 있으므로
+      // bounding rect가 비정상이면 마우스 이벤트 좌표로 대체한다.
       let rect: DOMRect
       try {
         const sel = window.getSelection()
@@ -69,6 +72,11 @@ export class SelectionObserver {
         rect = (r && r.width > 0) ? r : inputEl.getBoundingClientRect()
       } catch {
         rect = inputEl.getBoundingClientRect()
+      }
+      const isDegenerate = rect.width < 4 || rect.height < 4 || (rect.x === 0 && rect.y === 0)
+      if (isDegenerate) {
+        // 마우스 위치를 중심으로 1×1 가상 rect 생성
+        rect = new DOMRect(e.clientX, e.clientY, 1, 1)
       }
 
       const sourceMeta: SourceMeta = {
@@ -89,10 +97,18 @@ export class SelectionObserver {
     const text = selection?.toString().trim() ?? ''
 
     if (!text) {
-      // editable 영역 내 단순 클릭(커서 이동)은 callback(null)을 호출하지 않는다.
-      // hide() → removeAllRanges() 체인으로 contenteditable 커서가 파괴되는 것을 방지.
-      if (isEditableTarget(target)) return
       this.lastSnapshot = null
+      this.callback(null)
+      return
+    }
+
+    // 유령 선택(Ghost Selection) 방어:
+    // 드래그 없는 단순 클릭인데 이전 스냅샷과 텍스트가 동일하면
+    // 에디터의 selection 해제 지연으로 보고 툴바를 띄우지 않는다.
+    const dx = Math.abs(e.clientX - this.mouseDownPos.x)
+    const dy = Math.abs(e.clientY - this.mouseDownPos.y)
+    const isClick = dx < 5 && dy < 5
+    if (isClick && this.lastSnapshot && text === this.lastSnapshot.text) {
       this.callback(null)
       return
     }
@@ -112,21 +128,50 @@ export class SelectionObserver {
     const EDITABLE_ATTR = '[contenteditable="true"], [contenteditable=""], [role="textbox"]'
 
     // ceEl 루트 탐색 전용: write area 확정 후에만 사용 (focus + execCommand 안정화)
+    // Lexical: [data-lexical-editor="true"], Slate: [data-slate-editor="true"] 추가
     const CE_ROOT =
       EDITABLE_ATTR + ', ' +
-      '.ProseMirror, .cm-editor, .monaco-editor, .ql-editor, .CodeMirror'
+      '.ProseMirror, .cm-editor, .monaco-editor, .ql-editor, .CodeMirror, ' +
+      '[data-lexical-editor="true"], [data-slate-editor="true"]'
 
-    const isWriteArea =
+    let isWriteArea =
       anchorEl?.isContentEditable ||
       anchorEl?.getAttribute('role') === 'textbox' ||
       !!anchorEl?.closest(EDITABLE_ATTR)
+
+    // AI 사이트 코드블록/답변 읽기 전용 컨테이너 예외:
+    // <pre>, <code>, .markdown, .prose 등의 내부는 하이라이팅 라이브러리가
+    // contenteditable을 심더라도 실제 편집 불가 영역이므로 read mode로 강제 전환.
+    // 단, textarea / input 은 이 경로에 오지 않으므로 실제 입력창은 영향 없음.
+    const READ_ONLY_CONTAINER =
+      'pre, code, ' +
+      '.markdown, .prose, ' +
+      '[class*="markdown"], [class*="prose"], ' +
+      '[data-message-author-role], ' +   // ChatGPT 답변 컨테이너
+      '.claude-content, .response-content'  // Claude 등 AI 답변 래퍼
+    if (isWriteArea && anchorEl?.closest(READ_ONLY_CONTAINER)) {
+      // VIP 프리패스: 실제 입력창(#prompt-textarea 등)은 읽기 전용 컨테이너 안에
+      // 있더라도 무조건 쓰기 모드로 복구한다.
+      const VIP_WRITE_SELECTOR = '#prompt-textarea'
+      if (!anchorEl?.closest(VIP_WRITE_SELECTOR)) {
+        isWriteArea = false
+      }
+    }
 
     if (isWriteArea) {
       // Write mode — contenteditable / role="textbox" / 리치 에디터
       // ceEl: 항상 closest()로 루트 컨테이너를 탐색.
       // anchorEl.isContentEditable이 true여도 <p>/<span> 같은 deep child일 수 있으므로
       // 직접 사용하지 않고 루트를 찾아야 el.focus() + execCommand가 안정적으로 동작함.
-      const ceEl = anchorEl?.closest(CE_ROOT) as HTMLElement | null ?? anchorEl
+      let ceEl = anchorEl?.closest(CE_ROOT) as HTMLElement | null
+      if (!ceEl) {
+        // closest()로 루트를 찾지 못한 경우 (Shadow DOM 경계, 비표준 에디터 등)
+        // document.activeElement가 contenteditable이면 그것을 루트로 사용
+        const active = document.activeElement
+        ceEl = (active instanceof HTMLElement && active.isContentEditable)
+          ? active
+          : anchorEl
+      }
 
       const sourceMeta: SourceMeta = {
         el:                ceEl ?? anchorEl,
@@ -157,15 +202,15 @@ export class SelectionObserver {
     // P0-5: 우클릭(contextmenu 직전)은 툴바를 숨기지 않는다
     if (e.button === 2) return
 
+    // 유령 선택 방어: mousedown 좌표를 기록해 mouseup에서 드래그 여부를 판별
+    this.mouseDownPos = { x: e.clientX, y: e.clientY }
+
     const target = e.target as HTMLElement
 
     // Aurora 자체 UI 클릭은 무시 (툴바 + 팝업 셸)
     if (target.closest('#aurora-toolbar') || target.closest('#aurora-shell')) return
 
-    // editable 영역 클릭은 무시 — focus/커서를 절대 깨지 않음
-    if (isEditableTarget(target)) return
-
-    // 그 외 바깥 클릭 시 툴바 숨김
+    // Aurora UI 외의 어떤 곳을 클릭해도 즉시 툴바 숨김
     this.callback(null)
   }
 

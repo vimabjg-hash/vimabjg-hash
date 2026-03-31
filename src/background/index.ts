@@ -22,6 +22,9 @@
 export type MessageType =
   // ── 현재 활성 ──────────────────────────────────────────
   | 'OPEN_SIDEPANEL'          // 사이드패널 열기 (floating-shell → background)
+  | 'TOGGLE_SIDEPANEL'        // 사이드패널 토글 (floating-button → background)
+  | 'CALL_CLOUD_AI'           // Cloud AI API 중계 (sidepanel → background)
+  | 'AUTO_RUN_PROMPT'         // 컨텍스트 메뉴 → 사이드패널 자동 실행 (background → sidepanel)
 
   // ── PHASE 2: 외부 API 연동 ─────────────────────────────
   | 'NOTION_SAVE'             // Notion 페이지에 저장
@@ -31,6 +34,10 @@ export type MessageType =
   // ── PHASE 2: 사이트 특화 기능 ──────────────────────────
   | 'FETCH_YOUTUBE_TRANSCRIPT'// YouTube 자막 가져오기
   | 'OPEN_TABS_BATCH'         // 여러 탭 한꺼번에 열기 (멀티 AI 기능)
+
+  // ── PHASE 2: 사이트 특화 ───────────────────────────────
+  | 'YOUTUBE_SUMMARY_REQUEST' // YouTube 영상 요약 요청 (content → background)
+  | 'EXECUTE_YOUTUBE_SUMMARY' // YouTube 요약 실행 (background → sidepanel)
 
   // ── PHASE 3: 고급 기능 ─────────────────────────────────
   | 'SCHEDULE_TASK'           // 주기적 작업 등록 (알림 등)
@@ -54,9 +61,21 @@ type HandlerFn = (
   sender: chrome.runtime.MessageSender
 ) => Promise<AuroraResponse>
 
+// ── 사이드패널 열림 상태 추적 ────────────────────────────────
+let isSidePanelOpen = false
+
+chrome.runtime.onConnect.addListener((port) => {
+  if (port.name !== 'aurora-sidepanel') return
+  isSidePanelOpen = true
+  port.onDisconnect.addListener(() => { isSidePanelOpen = false })
+})
+
 const HANDLERS: Partial<Record<MessageType, HandlerFn>> = {
   // ── 현재 활성 핸들러 ──────────────────────────────────
   OPEN_SIDEPANEL:           handleOpenSidepanel,
+  TOGGLE_SIDEPANEL:         handleToggleSidepanel,
+  CALL_CLOUD_AI:            handleCallCloudAi,
+  YOUTUBE_SUMMARY_REQUEST:  handleYoutubeSummary,
 
   // ── 아래는 구현 후 주석 해제 ──────────────────────────
   // NOTION_SAVE:           handleNotionSave,
@@ -89,6 +108,34 @@ chrome.runtime.onMessage.addListener(
   }
 )
 
+// ── 컨텍스트 메뉴 생성 ──────────────────────────────────────
+chrome.runtime.onInstalled.addListener(() => {
+  chrome.contextMenus.create({
+    id: 'aurora-summary',
+    title: '✨ Aurora로 요약하기',
+    contexts: ['selection'],
+  })
+  chrome.contextMenus.create({
+    id: 'aurora-translate',
+    title: '🌐 Aurora로 번역하기',
+    contexts: ['selection'],
+  })
+})
+
+// ── 컨텍스트 메뉴 클릭 핸들러 ───────────────────────────────
+chrome.contextMenus.onClicked.addListener((info, tab) => {
+  if (!tab?.windowId || !info.selectionText) return
+
+  chrome.sidePanel.open({ windowId: tab.windowId }).catch(console.error)
+
+  setTimeout(() => {
+    const prompt = info.menuItemId === 'aurora-summary'
+      ? '다음 내용을 요약해 줘:\n\n' + info.selectionText
+      : '다음 내용을 자연스러운 한국어로 번역해 줘:\n\n' + info.selectionText
+    chrome.runtime.sendMessage({ type: 'AUTO_RUN_PROMPT', payload: prompt }).catch(() => {})
+  }, 800)
+})
+
 // ── 단축키 리스너 ────────────────────────────────────────────
 chrome.commands.onCommand.addListener((command) => {
   if (command === 'open-sidepanel') {
@@ -118,6 +165,131 @@ async function handleOpenSidepanel(
   }
   await chrome.sidePanel.open({ tabId })
   return { success: true }
+}
+
+// ── TOGGLE_SIDEPANEL ─────────────────────────────────────────
+// floating-button 클릭 시 호출 — 열려있으면 닫고, 닫혀있으면 열기
+async function handleToggleSidepanel(
+  _payload: unknown,
+  sender: chrome.runtime.MessageSender
+): Promise<AuroraResponse> {
+  try {
+    if (isSidePanelOpen) {
+      // 사이드패널 내부에 CLOSE_SIDEPANEL 메시지 전송 → sidepanel-app이 window.close() 호출
+      chrome.runtime.sendMessage({ action: 'CLOSE_SIDEPANEL' }).catch(() => {})
+    } else {
+      const windowId = sender.tab?.windowId ?? (await chrome.windows.getCurrent()).id
+      if (windowId) await chrome.sidePanel.open({ windowId })
+    }
+    return { success: true }
+  } catch (err) {
+    console.error('[Aurora] Toggle Error:', err)
+    return { success: false, error: String(err) }
+  }
+}
+
+
+// ── CALL_CLOUD_AI ────────────────────────────────────────────
+// sidepanel에서 Cloud AI(Gemini Flash / GPT-4o) 호출 시 중계
+// MV3 정책상 sidepanel에서 외부 API 직접 호출은 허용되지 않으므로
+// host_permissions를 가진 background가 대신 fetch합니다.
+
+interface CallCloudAiPayload {
+  provider: 'gemini' | 'openai'
+  model: string
+  apiKey: string
+  systemPrompt: string
+  userPrompt: string
+}
+
+async function handleCallCloudAi(payload: unknown): Promise<AuroraResponse> {
+  const p = payload as CallCloudAiPayload
+  const apiModel = p.model
+  try {
+    if (p.provider === 'gemini') {
+      const res = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${apiModel}:generateContent?key=${p.apiKey}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            system_instruction: { parts: { text: p.systemPrompt } },
+            contents: [{ role: 'user', parts: [{ text: p.userPrompt }] }],
+          }),
+        }
+      )
+      if (!res.ok) {
+        const errText = await res.text()
+        return { success: false, error: `API 오류 (${res.status}): ${errText}` }
+      }
+      const data = await res.json() as { candidates: { content: { parts: { text: string }[] } }[] }
+      const text = data.candidates?.[0]?.content?.parts?.[0]?.text ?? ''
+      return { success: true, data: text }
+    } else {
+      const res = await fetch('https://api.openai.com/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${p.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: apiModel,
+          messages: [
+            { role: 'system', content: p.systemPrompt },
+            { role: 'user',   content: p.userPrompt },
+          ],
+        }),
+      })
+      if (!res.ok) {
+        const errText = await res.text()
+        return { success: false, error: `API 오류 (${res.status}): ${errText}` }
+      }
+      const data = await res.json() as { choices: { message: { content: string } }[] }
+      const text = data.choices?.[0]?.message?.content ?? ''
+      return { success: true, data: text }
+    }
+  } catch (err) {
+    return { success: false, error: err instanceof Error ? err.message : String(err) }
+  }
+}
+
+
+// ── YOUTUBE_SUMMARY_REQUEST ──────────────────────────────────
+// YouTube 컨텐츠 스크립트에서 "Aurora 영상 요약" 클릭 시 호출됨.
+// 사이드패널을 열고, 렌더링 완료 후 EXECUTE_YOUTUBE_SUMMARY를 브로드캐스트.
+
+interface YoutubeSummaryPayload {
+  title: string
+  channel: string
+  description: string
+}
+
+async function handleYoutubeSummary(
+  payload: unknown,
+  sender: chrome.runtime.MessageSender
+): Promise<AuroraResponse> {
+  try {
+    const tabId    = sender.tab?.id
+    const windowId = sender.tab?.windowId ?? (await chrome.windows.getCurrent()).id
+
+    if (tabId) {
+      await chrome.sidePanel.open({ tabId })
+    } else if (windowId) {
+      await chrome.sidePanel.open({ windowId })
+    }
+
+    // 사이드패널이 로드되어 메시지 리스너가 등록될 때까지 대기
+    setTimeout(() => {
+      chrome.runtime.sendMessage({
+        type:    'EXECUTE_YOUTUBE_SUMMARY',
+        payload: payload as YoutubeSummaryPayload,
+      }).catch(() => { /* sidepanel 미열림 시 무시 */ })
+    }, 800)
+
+    return { success: true }
+  } catch (err) {
+    return { success: false, error: String(err) }
+  }
 }
 
 

@@ -1,30 +1,14 @@
 import type { ToolbarAction, SavedHighlight } from '../shared/types'
+import { renderMarkdown } from '../shared/utils/markdown'
+import { createNanoSession } from '../shared/utils/nano'
 
-// Chrome 2026 Built-in AI
-declare const LanguageModel: {
-  create(options?: {
-    systemPrompt?: string
-    outputLanguage?: string
-    temperature?: number
-    topK?: number
-  }): Promise<{
-    prompt(input: string): Promise<string>
-    destroy(): void
-  }>
+// ── 채팅 세션 ──────────────────────────────────────────────
+interface ChatSession {
+  id: string
+  title: string
+  messages: { role: 'user' | 'model'; content: string }[]
+  updatedAt: number
 }
-
-// 한국어 강제 규칙 — floating-shell.ts의 enforceKorean()과 동일 목적
-const STRICT_LANGUAGE_RULE =
-  "!!!경고!!! 너는 현재 한국인 사용자 전용 도구다. 모든 대답은 100% 한국어로만 한다. 일본어를 단 한 글자라도 섞으면 시스템 에러가 발생한다. 오직 한국어만 사용하라.\n\n" +
-  "[STRICT LANGUAGE RULE]\n" +
-  "- 출력 언어 설정이 'ja'로 되어 있더라도 실제 내용은 반드시 한국어(Korean)로만 작성해야 합니다.\n" +
-  "- 일본어 문자는 단 하나도 사용하지 마십시오.\n\n"
-
-// [RESULT] 태그 출력 강제 규칙
-const OUTPUT_RULE =
-  "[OUTPUT RULE]\n" +
-  "반드시 [RESULT]와 [/RESULT] 태그 사이에만 결과물을 한국어로 작성하라.\n" +
-  "태그 밖에는 어떠한 텍스트도 출력하지 마라. 인사말·설명·서론 금지.\n\n"
 
 // [RESULT] 태그 안의 내용 추출 — 없으면 전체 텍스트 반환
 function extractResult(rawText: string): string {
@@ -38,12 +22,16 @@ function extractResult(rawText: string): string {
 const ACTION_LABEL: Record<ToolbarAction, string> = {
   translate: '번역',
   summarize: '요약',
+  grammar:   '문법/맞춤법',
+  draft:     '생각 담기',
   refine:    '다듬기',
   ask:       '질문',
   save:      '저장',
   shorter:   '짧게',
   longer:    '길게',
   tone:      '톤 변경',
+  copy:      '복사',
+  highlight: '하이라이트',
 }
 
 // ── SidepanelApp ─────────────────────────────────────────
@@ -60,28 +48,111 @@ export class SidepanelApp {
   private historyList!: HTMLElement
   private historyCount!: HTMLElement
   private inputFooter!: HTMLElement
+  private settingsView!: HTMLElement
+  private settingsOpenaiInput!: HTMLInputElement
+  private settingsGeminiInput!: HTMLInputElement
+  private settingsSaveBtn!: HTMLButtonElement
 
   // 마지막으로 받은 컨텍스트 (추가 질문에 활용)
   private lastContext: { action: ToolbarAction; text: string } | null = null
 
+  // 채팅 세션 히스토리
+  private chatSessions: ChatSession[] = []
+  private currentSessionId: string | null = null
+  private historyDrawer!: HTMLElement
+  private sessionListEl!: HTMLElement
+
+  // 페이지 컨텍스트 포함 체크박스
+  private pageContextCheckbox!: HTMLInputElement
+
   init(): void {
-    this.chatArea         = document.getElementById('chat-area')!
-    this.userInput        = document.getElementById('user-input') as HTMLTextAreaElement
-    this.sendBtn          = document.getElementById('send-btn') as HTMLButtonElement
-    this.contextIndicator = document.getElementById('context-indicator')!
-    this.historyView      = document.getElementById('history-view')!
-    this.historyList      = document.getElementById('history-list')!
-    this.historyCount     = document.getElementById('history-count')!
-    this.inputFooter      = document.getElementById('input-footer')!
+    chrome.runtime.connect({ name: 'aurora-sidepanel' })
+
+    // 패널 닫기 + YouTube 요약 등 background 브로드캐스트 수신
+    chrome.runtime.onMessage.addListener((request: {
+      action?: string
+      type?: string
+      payload?: unknown
+    }) => {
+      if (request.action === 'CLOSE_SIDEPANEL') {
+        window.close()
+        return
+      }
+      if (request.type === 'EXECUTE_YOUTUBE_SUMMARY') {
+        const p = request.payload as { title: string; channel: string; description: string }
+        this.executeYoutubeSummary(p)
+      }
+      if (request.type === 'AUTO_RUN_PROMPT') {
+        this.startNewChat()
+        this.userInput.value = request.payload as string
+        this.sendMessage()
+      }
+    })
+    this.chatArea          = document.getElementById('chat-area')!
+    this.userInput         = document.getElementById('user-input') as HTMLTextAreaElement
+    this.sendBtn           = document.getElementById('send-btn') as HTMLButtonElement
+    this.contextIndicator  = document.getElementById('context-indicator')!
+    this.historyView       = document.getElementById('history-view')!
+    this.historyList       = document.getElementById('history-list')!
+    this.historyCount      = document.getElementById('history-count')!
+    this.inputFooter       = document.getElementById('input-footer')!
+    this.settingsView      = document.getElementById('settings-view')!
+    this.settingsOpenaiInput = document.getElementById('settings-openai-key') as HTMLInputElement
+    this.settingsGeminiInput = document.getElementById('settings-gemini-key') as HTMLInputElement
+    this.settingsSaveBtn   = document.getElementById('settings-save-btn') as HTMLButtonElement
 
     document.getElementById('clear-all-btn')!
       .addEventListener('click', () => void this.clearAllHighlights())
 
+    this.settingsSaveBtn.addEventListener('click', () => void this.saveApiKeys())
+
+    this.historyDrawer        = document.getElementById('history-drawer')!
+    this.sessionListEl        = document.getElementById('session-list')!
+    this.pageContextCheckbox  = document.getElementById('use-page-context') as HTMLInputElement
+
+    // 체크박스 상태 변화 시 레이블 색상 업데이트
+    const pageToggleLabel = document.getElementById('page-context-toggle')
+    this.pageContextCheckbox.addEventListener('change', () => {
+      pageToggleLabel?.classList.toggle('active', this.pageContextCheckbox.checked)
+    })
+
+    // 새 채팅 버튼
+    document.getElementById('new-chat-btn')?.addEventListener('click', () => {
+      this.startNewChat()
+    })
+
+    // 대화 기록 버튼 (토글)
+    document.getElementById('history-btn')?.addEventListener('click', () => {
+      if (this.historyDrawer.classList.contains('hidden')) {
+        this.renderSessionList()
+        this.historyDrawer.classList.remove('hidden')
+      } else {
+        this.historyDrawer.classList.add('hidden')
+      }
+    })
+
+    // 드로어 닫기 버튼
+    document.getElementById('close-drawer-btn')?.addEventListener('click', () => {
+      this.historyDrawer.classList.add('hidden')
+    })
+
+    // 사이드바 토글 버튼
+    document.getElementById('sidebar-toggle-btn')?.addEventListener('click', () => {
+      const slim = document.querySelector<HTMLElement>('.slim-sidebar')
+      const main = document.querySelector<HTMLElement>('.main-panel')
+      if (!slim || !main) return
+      const isHidden = slim.style.display === 'none'
+      slim.style.display      = isHidden ? 'flex'  : 'none'
+      main.style.borderRadius = isHidden ? '0 12px 12px 0' : '12px'
+    })
+
     this.bindInput()
     this.bindSidebarBtns()
+    this.bindCopyButtons(this.chatArea)
     this.listenRuntime()
     this.loadPending()
     this.bindModelSelect()
+    void this.loadSessions()
 
     // 첫 실행 시 환영 메시지
     this.appendAiBubble('안녕하세요! 웹페이지에서 텍스트를 드래그하여 선택하면 Aurora가 바로 도와드립니다. 아래 입력창에 질문을 직접 입력해도 됩니다.')
@@ -89,7 +160,7 @@ export class SidepanelApp {
 
   // ── 모델 선택기 바인딩 ──────────────────────────────────
   private bindModelSelect(): void {
-    const sel = document.querySelector<HTMLSelectElement>('.model-select')
+    const sel = document.getElementById('model-select-bottom') as HTMLSelectElement | null
     if (!sel) return
     void chrome.storage.local.get('aurora_model').then((res) => {
       sel.value = (res['aurora_model'] as string) ?? 'gemini-nano'
@@ -113,10 +184,26 @@ export class SidepanelApp {
       }
     })
 
-    // 입력창 자동 높이 조절
+    // 입력창 자동 높이 조절 + 슬래시 명령어 자동 치환
     this.userInput.addEventListener('input', () => {
       this.userInput.style.height = 'auto'
       this.userInput.style.height = `${Math.min(this.userInput.scrollHeight, 120)}px`
+
+      const value = this.userInput.value
+      const SLASH_COMMANDS: [string, string][] = [
+        ['/요약 ', '다음 텍스트의 핵심 내용을 3줄로 요약해 줘:\n\n'],
+        ['/번역 ', '다음 텍스트를 자연스럽고 매끄러운 한국어로 번역해 줘:\n\n'],
+        ['/코드 ', '다음 코드의 동작 원리를 초보자도 이해하기 쉽게 단계별로 설명해 줘:\n\n'],
+        ['/메일 ', '다음 내용을 바탕으로 정중하고 프로페셔널한 비즈니스 이메일을 작성해 줘:\n\n'],
+      ]
+      for (const [cmd, expansion] of SLASH_COMMANDS) {
+        if (value.includes(cmd)) {
+          this.userInput.value = value.replace(cmd, expansion)
+          this.userInput.style.height = 'auto'
+          this.userInput.style.height = `${Math.min(this.userInput.scrollHeight, 120)}px`
+          break
+        }
+      }
     })
   }
 
@@ -126,8 +213,55 @@ export class SidepanelApp {
     this.userInput.value = ''
     this.userInput.style.height = 'auto'
 
+    // UI에는 원래 메시지만 표시
+    this.addMessageToSession('user', text)
     this.appendUserBubble(text)
-    void this.runAI(text)
+    void this.sendWithContext(text)
+  }
+
+  // 페이지 컨텍스트 체크 후 AI 호출
+  private async sendWithContext(originalText: string): Promise<void> {
+    if (!this.pageContextCheckbox?.checked) {
+      await this.runAI(originalText)
+      return
+    }
+
+    // 로딩 상태
+    this.sendBtn.disabled = true
+    const prevPlaceholder = this.userInput.placeholder
+    this.userInput.placeholder = '페이지 읽는 중...'
+
+    try {
+      const pageContent = await this.getCurrentPageContent()
+      const aiPrompt = pageContent
+        ? `[현재 웹페이지 컨텍스트]\n${pageContent}\n\n[사용자 질문]\n${originalText}`
+        : originalText
+      await this.runAI(aiPrompt)
+    } finally {
+      this.sendBtn.disabled = false
+      this.userInput.placeholder = prevPlaceholder
+    }
+  }
+
+  // 현재 활성 탭의 본문 텍스트 추출 (최대 3만 자)
+  private async getCurrentPageContent(): Promise<string> {
+    try {
+      // lastFocusedWindow: 사이드패널 컨텍스트에서 currentWindow는 패널 자체를 가리킬 수 있어 실패함
+      const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true })
+      const tabId = tabs[0]?.id
+      if (!tabId) {
+        console.warn('[Aurora] 활성 탭을 찾을 수 없음')
+        return ''
+      }
+      const results = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: () => document.body.innerText.substring(0, 30000),
+      })
+      return (results[0]?.result as string | null | undefined) ?? ''
+    } catch (error) {
+      console.error('[Aurora] 텍스트 추출 실패:', error)
+      return ''
+    }
   }
 
   // ── 사이드바 버튼 ───────────────────────────────────────
@@ -140,7 +274,7 @@ export class SidepanelApp {
       this.showHistoryPanel()
     })
     document.getElementById('sb-settings')?.addEventListener('click', () => {
-      this.appendAiBubble('설정 기능은 준비 중입니다.')
+      this.showSettingsPanel()
     })
   }
 
@@ -207,6 +341,11 @@ export class SidepanelApp {
 
     // AI 결과 말풍선 표시
     this.appendAiBubble(val.result)
+
+    // 세션에 저장 (컨텍스트 요약 → user, AI 결과 → model)
+    const userMsg = `[${ACTION_LABEL[val.action]}] ${val.text.slice(0, 80)}`
+    this.addMessageToSession('user', userMsg)
+    this.addMessageToSession('model', val.result)
   }
 
   // ── AI 호출 (사이드패널에서 직접 질문할 때) ─────────────
@@ -215,28 +354,64 @@ export class SidepanelApp {
     // 로딩 말풍선 먼저 표시
     const { setContent, setError } = this.appendAiBubble('', true)
 
-    const systemPrompt =
-      STRICT_LANGUAGE_RULE +
-      OUTPUT_RULE +
-      '당신은 도움이 되는 AI 어시스턴트입니다. 반드시 한국어로 답변하세요. 간결하고 명확하게 답하세요.'
+    // 클라우드 AI용 시스템 프롬프트 (createNanoSession 내부에서 처리하므로 Nano는 불필요)
+    const systemPrompt = '당신은 도움이 되는 AI 어시스턴트입니다. 반드시 한국어로 답변하세요. 간결하고 명확하게 답하세요.'
 
     // 이전 컨텍스트가 있으면 프롬프트에 포함
-    const basePrompt = this.lastContext
+    const userPrompt = this.lastContext
       ? `[컨텍스트: 사용자가 "${this.lastContext.text}" 텍스트에 대해 ${ACTION_LABEL[this.lastContext.action]} 작업 중]\n\n[질문]\n${userText}`
       : userText
-    const prompt = basePrompt + '\n\n오직 최종 답변만 [RESULT] 태그 안에 작성해. 시작한다:\n[RESULT]'
 
-    let session: Awaited<ReturnType<typeof LanguageModel.create>> | null = null
+    // 현재 선택된 모델과 저장된 API 키 조회
+    const [modelRes, keysRes] = await Promise.all([
+      chrome.storage.local.get('aurora_model'),
+      chrome.storage.local.get('aurora_api_keys'),
+    ])
+    const model = (modelRes['aurora_model'] as string | undefined) ?? 'gemini-nano'
+    const keys  = keysRes['aurora_api_keys'] as { openai?: string; gemini?: string } | undefined
+
+    // ── Gemini Nano (로컬) ────────────────────────────────
+    if (model === 'gemini-nano') {
+      let session: Awaited<ReturnType<typeof createNanoSession>> | null = null
+      try {
+        session = await createNanoSession()
+        const rawResponse = await session.prompt(userPrompt)
+        const result = extractResult(rawResponse)
+        setContent(result)
+        this.addMessageToSession('model', result)
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err))
+      } finally {
+        session?.destroy()
+      }
+      return
+    }
+
+    // ── Cloud AI (Gemini Flash / GPT-4o) ─────────────────
+    const isGemini  = model === 'gemini-2.5-flash'
+    const provider  = isGemini ? 'gemini' : 'openai'
+    const apiKey    = isGemini ? keys?.gemini : keys?.openai
+
+    if (!apiKey) {
+      setError(`${isGemini ? 'Gemini' : 'OpenAI'} API 키를 설정에서 입력해주세요.`)
+      return
+    }
+
     try {
-      session = await LanguageModel.create({ systemPrompt, outputLanguage: 'ja', temperature: 0.6, topK: 5 })
-      const rawResponse = await session.prompt(prompt)
-      console.log('[ORARA-DEBUG] Nano Raw Response:', rawResponse)
-      setContent(extractResult(rawResponse))
+      const response = await chrome.runtime.sendMessage({
+        type: 'CALL_CLOUD_AI',
+        payload: { provider, model, apiKey, systemPrompt, userPrompt },
+      }) as { success: boolean; data?: string; error?: string }
+
+      if (response.success && response.data) {
+        const result = extractResult(response.data as string)
+        setContent(result)
+        this.addMessageToSession('model', result)
+      } else {
+        setError(response.error ?? '알 수 없는 오류가 발생했습니다.')
+      }
     } catch (err) {
-      const error = err instanceof Error ? err.message : String(err)
-      setError(error)
-    } finally {
-      session?.destroy()
+      setError(err instanceof Error ? err.message : String(err))
     }
   }
 
@@ -292,7 +467,7 @@ export class SidepanelApp {
       dots.innerHTML = '<span></span><span></span><span></span>'
       bubble.appendChild(dots)
     } else if (text) {
-      bubble.textContent = text
+      bubble.innerHTML = renderMarkdown(text)
     }
 
     row.append(avatar, bubble)
@@ -303,7 +478,7 @@ export class SidepanelApp {
     return {
       el: row,
       setContent: (t: string) => {
-        bubble.textContent = t
+        bubble.innerHTML = renderMarkdown(t)
         this.scrollToBottom()
       },
       setError: (e: string) => {
@@ -350,22 +525,50 @@ export class SidepanelApp {
   private showChatPanel(): void {
     document.getElementById('sb-chat')?.classList.add('active')
     document.getElementById('sb-history')?.classList.remove('active')
-    this.chatArea.style.display    = 'flex'
-    this.inputFooter.style.display = 'block'
-    this.historyView.style.display = 'none'
+    document.getElementById('sb-settings')?.classList.remove('active')
+    this.chatArea.style.display      = 'flex'
+    this.inputFooter.style.display   = 'block'
+    this.historyView.style.display   = 'none'
+    this.settingsView.style.display  = 'none'
   }
 
   private showHistoryPanel(): void {
     document.getElementById('sb-history')?.classList.add('active')
     document.getElementById('sb-chat')?.classList.remove('active')
-    this.chatArea.style.display    = 'none'
-    this.inputFooter.style.display = 'none'
-    this.historyView.style.display = 'flex'
+    document.getElementById('sb-settings')?.classList.remove('active')
+    this.chatArea.style.display      = 'none'
+    this.inputFooter.style.display   = 'none'
+    this.historyView.style.display   = 'flex'
+    this.settingsView.style.display  = 'none'
 
     void chrome.storage.local.get('aurora_highlights').then((result) => {
       const highlights: SavedHighlight[] = result['aurora_highlights'] ?? []
       this.renderHistory(highlights)
     })
+  }
+
+  private showSettingsPanel(): void {
+    document.getElementById('sb-settings')?.classList.add('active')
+    document.getElementById('sb-chat')?.classList.remove('active')
+    document.getElementById('sb-history')?.classList.remove('active')
+    this.chatArea.style.display      = 'none'
+    this.inputFooter.style.display   = 'none'
+    this.historyView.style.display   = 'none'
+    this.settingsView.style.display  = 'flex'
+
+    void chrome.storage.local.get('aurora_api_keys').then((res) => {
+      const keys = res['aurora_api_keys'] as { openai?: string; gemini?: string } | undefined
+      if (keys?.openai) this.settingsOpenaiInput.value = keys.openai
+      if (keys?.gemini) this.settingsGeminiInput.value = keys.gemini
+    })
+  }
+
+  private async saveApiKeys(): Promise<void> {
+    const openai = this.settingsOpenaiInput.value.trim()
+    const gemini = this.settingsGeminiInput.value.trim()
+    await chrome.storage.local.set({ aurora_api_keys: { openai, gemini } })
+    this.settingsSaveBtn.textContent = '✓ 저장됨'
+    setTimeout(() => { this.settingsSaveBtn.textContent = '저장' }, 1500)
   }
 
   // ── 히스토리 렌더링 ─────────────────────────────────────
@@ -443,8 +646,153 @@ export class SidepanelApp {
     this.renderHistory(updated)
   }
 
+  // ── 코드 블록 복사 버튼 이벤트 위임 ──────────────────────────
+  private bindCopyButtons(containerEl: HTMLElement): void {
+    containerEl.addEventListener('click', async (e) => {
+      const target = e.target as HTMLElement
+      if (!target.classList.contains('aurora-copy-btn')) return
+      const code = target.nextElementSibling?.querySelector('code')
+      if (!code) return
+      try {
+        await navigator.clipboard.writeText(code.innerText)
+        const orig = target.innerText
+        target.innerText     = '✔ 복사됨'
+        target.style.color   = '#a6e3a1'
+        setTimeout(() => {
+          target.innerText   = orig
+          target.style.color = '#a6adc8'
+        }, 2000)
+      } catch { /* clipboard 권한 없음 — 무시 */ }
+    })
+  }
+
   private async clearAllHighlights(): Promise<void> {
     await chrome.storage.local.remove('aurora_highlights')
     this.renderHistory([])
+  }
+
+  // ── YouTube 영상 요약 자동 실행 ──────────────────────────
+  private executeYoutubeSummary(payload: {
+    title: string
+    channel: string
+    description: string
+  }): void {
+    this.startNewChat()
+
+    const prompt =
+      `[유튜브 영상 요약 요청]\n` +
+      `- 제목: ${payload.title}\n` +
+      `- 채널: ${payload.channel || '(알 수 없음)'}\n` +
+      `- 설명: ${payload.description || '(설명 없음)'}\n\n` +
+      `위 유튜브 영상의 핵심 내용을 한눈에 보기 쉽게 구조화해서 요약해 줘.`
+
+    // 입력창에 프롬프트를 채우고 즉시 전송
+    this.userInput.value = prompt
+    this.sendMessage()
+  }
+
+  // ── 채팅 세션 히스토리 ───────────────────────────────────
+
+  private async loadSessions(): Promise<void> {
+    const res = await chrome.storage.local.get('aurora_chats')
+    this.chatSessions = (res['aurora_chats'] as ChatSession[] | undefined) ?? []
+  }
+
+  private async saveSessions(): Promise<void> {
+    await chrome.storage.local.set({ aurora_chats: this.chatSessions })
+  }
+
+  private createNewSession(firstMessage: string): void {
+    const session: ChatSession = {
+      id:        crypto.randomUUID(),
+      title:     firstMessage.slice(0, 30) || '새 대화',
+      messages:  [],
+      updatedAt: Date.now(),
+    }
+    this.chatSessions.unshift(session)
+    this.currentSessionId = session.id
+    void this.saveSessions()
+  }
+
+  private addMessageToSession(role: 'user' | 'model', content: string): void {
+    if (!this.currentSessionId) {
+      this.createNewSession(role === 'user' ? content : '대화')
+    }
+    const session = this.chatSessions.find(s => s.id === this.currentSessionId)
+    if (!session) return
+    session.messages.push({ role, content })
+    session.updatedAt = Date.now()
+    void this.saveSessions()
+  }
+
+  private renderSessionList(): void {
+    while (this.sessionListEl.firstChild) {
+      this.sessionListEl.removeChild(this.sessionListEl.firstChild)
+    }
+
+    if (this.chatSessions.length === 0) {
+      const empty = document.createElement('li')
+      empty.style.cssText = 'padding:16px;text-align:center;color:#6c7086;font-size:13px;'
+      empty.textContent = '저장된 대화가 없습니다.'
+      this.sessionListEl.appendChild(empty)
+      return
+    }
+
+    const sorted = [...this.chatSessions].sort((a, b) => b.updatedAt - a.updatedAt)
+    for (const session of sorted) {
+      const li = document.createElement('li')
+      li.className = 'session-item' + (session.id === this.currentSessionId ? ' active' : '')
+
+      const title = document.createElement('div')
+      title.className = 'session-title'
+      title.textContent = session.title
+
+      const meta = document.createElement('div')
+      meta.className = 'session-meta'
+      const d = new Date(session.updatedAt)
+      meta.textContent = `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')} · ${session.messages.length}개`
+
+      li.append(title, meta)
+      li.addEventListener('click', () => {
+        this.historyDrawer.classList.add('hidden')
+        this.loadSession(session.id)
+      })
+      this.sessionListEl.appendChild(li)
+    }
+  }
+
+  private loadSession(id: string): void {
+    const session = this.chatSessions.find(s => s.id === id)
+    if (!session) return
+    this.currentSessionId = id
+
+    // 채팅 영역 초기화 후 메시지 재렌더링
+    while (this.chatArea.firstChild) {
+      this.chatArea.removeChild(this.chatArea.firstChild)
+    }
+
+    for (const msg of session.messages) {
+      if (msg.role === 'user') {
+        this.appendUserBubble(msg.content)
+      } else {
+        this.appendAiBubble(msg.content)
+      }
+    }
+
+    this.showChatPanel()
+  }
+
+  private startNewChat(): void {
+    this.currentSessionId = null
+
+    while (this.chatArea.firstChild) {
+      this.chatArea.removeChild(this.chatArea.firstChild)
+    }
+
+    this.lastContext = null
+    this.contextIndicator.textContent = ''
+    this.historyDrawer.classList.add('hidden')
+    this.appendAiBubble('새 대화를 시작합니다. 웹페이지에서 텍스트를 선택하거나 아래에 질문을 입력하세요.')
+    this.showChatPanel()
   }
 }

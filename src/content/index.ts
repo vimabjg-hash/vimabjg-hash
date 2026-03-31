@@ -1,6 +1,8 @@
 import { SelectionObserver } from './selection/selection-observer'
 import { SelectionToolbar } from './selection/selection-toolbar'
 import { FloatingShell } from './ui/floating-shell'
+import { QuickLauncher } from './ui/quick-launcher'
+import { initYouTubeSummarizer } from './youtube'
 import type { SelectionInfo } from './selection/selection-observer'
 import type { SavedHighlight } from '../shared/types'
 
@@ -73,41 +75,106 @@ async function saveHighlight(text: string, rect: DOMRect): Promise<void> {
 function injectFloatingBtn(): void {
   if (document.getElementById('aurora-float-btn')) return
 
+  const wrapper = document.createElement('div')
+  wrapper.id = 'aurora-float-wrapper'
+  Object.assign(wrapper.style, {
+    position:      'fixed',
+    right:         '0',
+    top:           '50%',
+    transform:     'translateY(-50%)',
+    display:       'flex',
+    flexDirection: 'column',
+    alignItems:    'flex-end',
+    zIndex:        '2147483647',
+  })
+  wrapper.style.setProperty('pointer-events', 'auto', 'important')
+
+  // ── 닫기 팝업 버튼 (호버 시 나타남) ──────────────────
+  const closePopup = document.createElement('button')
+  closePopup.id    = 'aurora-close-popup'
+  closePopup.title = '사이드패널 닫기'
+  closePopup.innerHTML = `
+    <svg viewBox="0 0 24 24" width="12" height="12" stroke="currentColor" stroke-width="2.5" fill="none">
+      <path d="M18 6L6 18M6 6l12 12"/>
+    </svg>
+    <span style="font-size:10px;margin-left:3px;">닫기</span>
+  `
+  Object.assign(closePopup.style, {
+    display:        'none',
+    alignItems:     'center',
+    justifyContent: 'center',
+    background:     '#1a1c2e',
+    border:         '1px solid #f38ba8',
+    borderRadius:   '8px 0 0 8px',
+    color:          '#f38ba8',
+    cursor:         'pointer',
+    padding:        '5px 8px',
+    marginBottom:   '4px',
+    fontSize:       '11px',
+    whiteSpace:     'nowrap',
+    boxShadow:      '-2px 0 8px rgba(0,0,0,0.4)',
+    transition:     'background 0.15s',
+    borderRight:    'none',
+  })
+  closePopup.addEventListener('mouseenter', () => { closePopup.style.background = '#313244' })
+  closePopup.addEventListener('mouseleave', () => { closePopup.style.background = '#1a1c2e' })
+  closePopup.addEventListener('click', (e) => {
+    e.stopPropagation()
+    try { chrome.runtime?.sendMessage({ action: 'CLOSE_SIDEPANEL' }) } catch { /* invalidated */ }
+    closePopup.style.display = 'none'
+  })
+
+  // ── 메인 플로팅 버튼 (열기 전용) ─────────────────────
   const btn = document.createElement('button')
-  btn.id = 'aurora-float-btn'
+  btn.id    = 'aurora-float-btn'
   btn.title = 'Aurora 패널 열기'
   btn.innerHTML = `<svg viewBox="0 0 100 100" width="20" height="20" fill="none" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="af-g" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#8b5cf6"/><stop offset="100%" stop-color="#ec4899"/></linearGradient></defs><path d="M20 80L50 20L80 80" stroke="url(#af-g)" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/><path d="M35 80L50 50L65 80" stroke="white" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" opacity="0.6"/></svg>`
   Object.assign(btn.style, {
-    position:        'fixed',
-    right:           '0',
-    top:             '50%',
-    transform:       'translateY(-50%)',
-    zIndex:          '2147483646',
-    width:           '32px',
-    height:          '44px',
-    background:      '#1a1c2e',
-    border:          '1px solid #3d3f58',
-    borderRight:     'none',
-    borderRadius:    '8px 0 0 8px',
-    cursor:          'pointer',
-    display:         'flex',
-    alignItems:      'center',
-    justifyContent:  'center',
-    boxShadow:       '-2px 0 12px rgba(0,0,0,0.4)',
-    transition:      'background 0.15s',
-  })
-  btn.addEventListener('mouseenter', () => { btn.style.background = '#313244' })
-  btn.addEventListener('mouseleave', () => { btn.style.background = '#1a1c2e' })
-  btn.addEventListener('click', () => {
-    try {
-      chrome.runtime?.sendMessage({ type: 'OPEN_SIDEPANEL' })
-    } catch {
-      // Extension context invalidated
-    }
+    width:          '32px',
+    height:         '44px',
+    background:     '#1a1c2e',
+    border:         '1px solid #3d3f58',
+    borderRight:    'none',
+    borderRadius:   '8px 0 0 8px',
+    cursor:         'pointer',
+    display:        'flex',
+    alignItems:     'center',
+    justifyContent: 'center',
+    boxShadow:      '-2px 0 12px rgba(0,0,0,0.4)',
+    transition:     'background 0.15s',
   })
 
-  document.body.appendChild(btn)
+  // 호버 시 닫기 팝업 표시
+  wrapper.addEventListener('mouseenter', () => {
+    btn.style.background     = '#313244'
+    closePopup.style.display = 'flex'
+  })
+  wrapper.addEventListener('mouseleave', () => {
+    btn.style.background     = '#1a1c2e'
+    closePopup.style.display = 'none'
+  })
+
+  // 클릭 → 열기 전용
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation()
+    try { chrome.runtime?.sendMessage({ type: 'OPEN_SIDEPANEL' }) } catch { /* invalidated */ }
+  })
+
+  wrapper.append(closePopup, btn)
+  document.body.appendChild(wrapper)
 }
+
+// ── YouTube 요약 버튼 주입 ───────────────────────────────
+initYouTubeSummarizer()
+
+// ── Quick Launcher (Alt+J) ────────────────────────────────
+const launcher = new QuickLauncher()
+document.addEventListener('keydown', (e) => {
+  if (e.altKey && e.code === 'KeyJ') {
+    e.preventDefault()
+    launcher.toggle()
+  }
+})
 
 // ── 저장 확인 토스트 (2초 후 사라짐) ───────────────────
 function showSaveToast(rect: DOMRect): void {

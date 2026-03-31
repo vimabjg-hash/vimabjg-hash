@@ -8,9 +8,14 @@
     "storage",
     "activeTab",
     "scripting",
-    "tabs"
+    "tabs",
+    "contextMenus"
   ],
-  "host_permissions": [],
+  "host_permissions": [
+    "<all_urls>",
+    "https://generativelanguage.googleapis.com/*",
+    "https://api.openai.com/*"
+  ],
   "background": {
     "service_worker": "service-worker-loader.js",
     "type": "module"
@@ -18,12 +23,15 @@
   "content_scripts": [
     {
       "js": [
-        "assets/index.ts-D8DYkQnr.js"
+        "assets/index.ts-loader-0CehW_zn.js"
       ],
       "matches": [
         "<all_urls>"
       ],
-      "run_at": "document_idle"
+      "run_at": "document_idle",
+      "css": [
+        "assets/nano-BEHUn5zE.css"
+      ]
     }
   ],
   "web_accessible_resources": [
@@ -32,7 +40,8 @@
         "<all_urls>"
       ],
       "resources": [
-        "assets/index.ts-D8DYkQnr.js"
+        "assets/nano-VLTHV4S7.js",
+        "assets/index.ts-DD5GHzWl.js"
       ],
       "use_dynamic_url": false
     }
